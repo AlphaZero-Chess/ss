@@ -412,7 +412,8 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   }, [playerColor, onGameEnd]);
 
   // Check if a piece is draggable - only allow player's pieces on player's turn
-  const isDraggablePiece = useCallback(({ piece, sourceSquare }) => {
+  // react-chessboard v5 API: canDragPiece receives { piece: { pieceType }, isSparePiece, square }
+  const canDragPiece = useCallback(({ piece, square }) => {
     // Don't allow dragging when thinking or game ended
     if (isThinking || gameStatus !== 'playing') {
       return false;
@@ -430,15 +431,22 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     }
     
     // Check if the piece belongs to the player
-    // piece is in format like 'wP', 'bK', etc.
-    const pieceColor = piece[0]; // 'w' or 'b'
+    // piece.pieceType is in format like 'wP', 'bK', etc.
+    const pieceType = piece?.pieceType || '';
+    const pieceColor = pieceType[0]; // 'w' or 'b'
     const playerPieceColor = playerColor === 'white' ? 'w' : 'b';
     
     return pieceColor === playerPieceColor;
   }, [isThinking, gameStatus, playerColor]);
 
   // Handle player move
-  const onDrop = useCallback((sourceSquare, targetSquare, piece) => {
+  // react-chessboard v5 API: onPieceDrop receives { piece, sourceSquare, targetSquare }
+  const onDrop = useCallback(({ piece, sourceSquare, targetSquare }) => {
+    // Handle null targetSquare (piece dropped off board)
+    if (!targetSquare) {
+      return false;
+    }
+    
     // Double check game state
     if (isThinking || gameStatus !== 'playing') {
       console.log('Cannot move - thinking or game ended');
@@ -748,21 +756,22 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
             data-testid="chess-board-container"
           >
             <Chessboard
-              id="chess-board"
-              position={position}
-              onPieceDrop={onDrop}
-              isDraggablePiece={isDraggablePiece}
-              boardWidth={boardSize}
-              boardOrientation={playerColor}
-              arePremovesAllowed={false}
-              customBoardStyle={{
-                borderRadius: '6px',
-                boxShadow: 'inset 0 0 15px rgba(0,0,0,0.4)'
+              options={{
+                id: "chess-board",
+                position: position,
+                onPieceDrop: onDrop,
+                canDragPiece: canDragPiece,
+                boardWidth: boardSize,
+                boardOrientation: playerColor,
+                boardStyle: {
+                  borderRadius: '6px',
+                  boxShadow: 'inset 0 0 15px rgba(0,0,0,0.4)'
+                },
+                squareStyles: customSquareStyles,
+                darkSquareStyle: { backgroundColor: '#4a5568' },
+                lightSquareStyle: { backgroundColor: '#a0aec0' },
+                animationDurationInMs: 180
               }}
-              customSquareStyles={customSquareStyles}
-              customDarkSquareStyle={{ backgroundColor: '#4a5568' }}
-              customLightSquareStyle={{ backgroundColor: '#a0aec0' }}
-              animationDuration={180}
             />
             
             {/* Resize Handle - Bottom Right Corner */}
