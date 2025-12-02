@@ -140,14 +140,13 @@ function getBookMoveForPosition(fen, color, enemyId) {
 // CHESS GAME COMPONENT
 // ═══════════════════════════════════════════════════════════════════════
 const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
-  // Initialize game state - create initial Chess instance once
-  // IMPORTANT: Use useRef for game instance to avoid state sync issues
-  const [gameInstance] = useState(() => new Chess());
-  const gameRef = useRef(gameInstance);
+  // CRITICAL FIX: Use a single Chess instance stored in ref
+  // The position state MUST always reflect gameRef.current.fen() exactly
+  const gameRef = useRef(new Chess());
   
-  // Position as FEN string - this drives the visual board
-  // CRITICAL: Initialize from the SAME game instance to ensure sync
-  const [position, setPosition] = useState(() => gameInstance.fen());
+  // Position as FEN string - this drives the visual board AND move validation
+  // react-chessboard uses this for both display and validating drops
+  const [position, setPosition] = useState(() => gameRef.current.fen());
   const [isThinking, setIsThinking] = useState(false);
   const [moveHistory, setMoveHistory] = useState([]);
   const [gameStatus, setGameStatus] = useState('playing');
@@ -388,8 +387,35 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     setTimeout(() => onGameEnd(result), 1500);
   }, [playerColor, onGameEnd]);
 
+  // Check if a piece is draggable - only allow player's pieces on player's turn
+  const isDraggablePiece = useCallback(({ piece, sourceSquare }) => {
+    // Don't allow dragging when thinking or game ended
+    if (isThinking || gameStatus !== 'playing') {
+      return false;
+    }
+    
+    const game = gameRef.current;
+    const turn = game.turn();
+    
+    // Check if it's player's turn
+    const isPlayerTurn = (playerColor === 'white' && turn === 'w') || 
+                         (playerColor === 'black' && turn === 'b');
+    
+    if (!isPlayerTurn) {
+      return false;
+    }
+    
+    // Check if the piece belongs to the player
+    // piece is in format like 'wP', 'bK', etc.
+    const pieceColor = piece[0]; // 'w' or 'b'
+    const playerPieceColor = playerColor === 'white' ? 'w' : 'b';
+    
+    return pieceColor === playerPieceColor;
+  }, [isThinking, gameStatus, playerColor]);
+
   // Handle player move
   const onDrop = useCallback((sourceSquare, targetSquare, piece) => {
+    // Double check game state
     if (isThinking || gameStatus !== 'playing') {
       console.log('Cannot move - thinking or game ended');
       return false;
@@ -401,7 +427,14 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
                          (playerColor === 'black' && turn === 'b');
     
     if (!isPlayerTurn) {
-      console.log('Not player turn');
+      console.log('Not player turn, current turn:', turn);
+      return false;
+    }
+    
+    // Verify the piece at source square matches expected
+    const pieceAtSource = game.get(sourceSquare);
+    if (!pieceAtSource) {
+      console.log('No piece at source:', sourceSquare);
       return false;
     }
     
@@ -413,14 +446,16 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
       });
       
       if (moveResult === null) {
-        console.log('Invalid move');
+        console.log('Invalid move from', sourceSquare, 'to', targetSquare);
         return false;
       }
       
       moveCountRef.current++;
       const newFen = game.fen();
       
-      // Update all state synchronously
+      console.log('Player move:', moveResult.san, 'New FEN:', newFen);
+      
+      // Update all state - this will cause react-chessboard to re-render
       setPosition(newFen);
       setCurrentTurn(game.turn());
       setIsInCheck(game.isCheck() && !game.isCheckmate());
@@ -435,14 +470,12 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         }));
       }
       
-      console.log('Player move:', moveResult.san, 'Position:', newFen);
-      
       if (game.isGameOver()) {
         handleGameOver(game);
         return true;
       }
       
-      // Trigger engine to make its move
+      // Trigger engine to make its move after a short delay
       setTimeout(() => {
         if (stockfishRef.current?.makeEngineMove) {
           stockfishRef.current.makeEngineMove();
@@ -694,8 +727,10 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
               id="chess-board"
               position={position}
               onPieceDrop={onDrop}
+              isDraggablePiece={isDraggablePiece}
               boardWidth={boardSize}
               boardOrientation={playerColor}
+              arePremovesAllowed={false}
               customBoardStyle={{
                 borderRadius: '6px',
                 boxShadow: 'inset 0 0 15px rgba(0,0,0,0.4)'
