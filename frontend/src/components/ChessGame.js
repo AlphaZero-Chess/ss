@@ -142,10 +142,12 @@ function getBookMoveForPosition(fen, color, enemyId) {
 const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   // Initialize game state - create initial Chess instance once
   // IMPORTANT: Use useRef for game instance to avoid state sync issues
-  const gameRef = useRef(new Chess());
+  const [gameInstance] = useState(() => new Chess());
+  const gameRef = useRef(gameInstance);
+  
   // Position as FEN string - this drives the visual board
-  // Initialize from the SAME game instance to ensure sync
-  const [position, setPosition] = useState('start');
+  // CRITICAL: Initialize from the SAME game instance to ensure sync
+  const [position, setPosition] = useState(() => gameInstance.fen());
   const [isThinking, setIsThinking] = useState(false);
   const [moveHistory, setMoveHistory] = useState([]);
   const [gameStatus, setGameStatus] = useState('playing');
@@ -161,6 +163,7 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   const boardContainerRef = useRef(null);
   const resizeStartRef = useRef({ x: 0, y: 0, size: 0 });
   const moveCountRef = useRef(0);
+  const hasInitializedEngineMove = useRef(false); // Prevent double initial move
   
   // Refs to store props for use in stockfish callback (avoid stale closures)
   const enemyRef = useRef(enemy);
@@ -226,10 +229,12 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         isEngineReady.current = true;
         console.log('Stockfish engine ready');
         // If player is black, engine (white) makes first move
-        if (playerColorRef.current === 'black') {
+        // Use flag to prevent double initialization
+        if (playerColorRef.current === 'black' && !hasInitializedEngineMove.current) {
+          hasInitializedEngineMove.current = true;
           setTimeout(() => {
             makeEngineMove();
-          }, 500);
+          }, 600);
         }
       } else if (line.startsWith('bestmove')) {
         const parts = line.split(' ');
@@ -264,8 +269,10 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         
         if (moveResult) {
           moveCountRef.current++;
-          // Update all state synchronously
+          // Update all state synchronously - get fresh FEN after move
           const newFen = game.fen();
+          
+          // Batch state updates
           setPosition(newFen);
           setCurrentTurn(game.turn());
           setIsInCheck(game.isCheck() && !game.isCheckmate());
@@ -295,7 +302,7 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
             setTimeout(() => onGameEndRef.current(result), 1500);
           }
           
-          console.log('Engine move applied:', moveResult.san, 'Position:', newFen);
+          console.log('Engine move applied:', moveResult.san, 'New FEN:', newFen);
         }
       } catch (e) {
         console.error('Engine move error:', e);
@@ -454,6 +461,7 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     const newGame = new Chess();
     gameRef.current = newGame;
     moveCountRef.current = 0;
+    hasInitializedEngineMove.current = false; // Reset initialization flag
     setPosition(newGame.fen());
     setCurrentTurn('w');
     setIsInCheck(false);
@@ -461,13 +469,15 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     setGameStatus('playing');
     setLastMove(null);
     setCapturedPieces({ white: [], black: [] });
+    setIsThinking(false);
     
     if (playerColor === 'black') {
+      hasInitializedEngineMove.current = true; // Set flag before calling
       setTimeout(() => {
-        if (stockfishRef.current?.makeEngineMove) {
+        if (stockfishRef.current?.makeEngineMove && isEngineReady.current) {
           stockfishRef.current.makeEngineMove();
         }
-      }, 500);
+      }, 600);
     }
   }, [playerColor]);
 
