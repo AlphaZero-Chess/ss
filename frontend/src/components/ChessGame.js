@@ -46,6 +46,97 @@ function analyzePositionType(fen) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// GET ENGINE SETTINGS - Pure function based on enemy type
+// ═══════════════════════════════════════════════════════════════════════
+function getEngineSettingsForEnemy(enemyId) {
+  switch (enemyId) {
+    case 'elegant':
+      return {
+        ...ELEGANT_CONFIG,
+        openings: ELEGANT_OPENINGS,
+        style: 'positional'
+      };
+    case 'nonelegant':
+      return {
+        ...NON_ELEGANT_CONFIG,
+        openings: NON_ELEGANT_OPENINGS,
+        style: 'aggressive'
+      };
+    case 'minia0':
+      return {
+        ...MINI_A0_CONFIG,
+        openings: MINI_A0_OPENINGS,
+        style: 'strategic'
+      };
+    default:
+      return {
+        ...ELEGANT_CONFIG,
+        openings: ELEGANT_OPENINGS,
+        style: 'balanced'
+      };
+  }
+}
+
+// Get adaptive depth based on game phase and position type
+function getAdaptiveDepthForPosition(currentFen, moveNumber, enemyId) {
+  const settings = getEngineSettingsForEnemy(enemyId);
+  const phase = getGamePhase(moveNumber, currentFen);
+  const posType = analyzePositionType(currentFen);
+  
+  let depth = settings.baseDepth;
+  
+  if (phase === "opening") {
+    depth = settings.openingDepth;
+  } else if (phase === "endgame") {
+    depth = settings.endgameDepth;
+  } else if (phase === "middlegame" || phase === "late-middlegame") {
+    if (posType === "tactical") {
+      depth = settings.tacticalDepth;
+    } else if (posType === "positional") {
+      depth = settings.positionalDepth;
+    }
+  }
+  
+  return depth;
+}
+
+// Get book move with WEIGHTED selection based on personality
+function getBookMoveForPosition(fen, color, enemyId) {
+  const settings = getEngineSettingsForEnemy(enemyId);
+  
+  // Try multiple FEN key formats
+  const fenParts = fen.split(' ');
+  const fenKey1 = fenParts.slice(0, 4).join(' ');
+  const fenKey2 = fenParts.slice(0, 3).join(' ') + ' -';
+  const fenKey3 = fenParts[0] + ' ' + fenParts[1] + ' ' + fenParts[2] + ' -';
+  
+  let position = settings.openings[fenKey1] || settings.openings[fenKey2] || settings.openings[fenKey3];
+  
+  if (!position) return null;
+  
+  const moves = color === 'w' ? position.white : position.black;
+  if (!moves || moves.length === 0) return null;
+  
+  // Apply personality-specific aggression boost to first (most aggressive) option
+  const aggressionBoost = settings.aggressionFactor || 0.5;
+  let adjustedMoves = moves.map((m, idx) => ({
+    ...m,
+    weight: m.weight * (idx === 0 ? aggressionBoost + 0.15 : 1)
+  }));
+  
+  // Weighted random selection - THIS is the key personality difference!
+  const totalWeight = adjustedMoves.reduce((sum, m) => sum + m.weight, 0);
+  let random = Math.random() * totalWeight;
+  
+  for (let moveOption of adjustedMoves) {
+    random -= moveOption.weight;
+    if (random <= 0) return moveOption.move;
+  }
+  
+  return moves[0].move;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // CHESS GAME COMPONENT
 // ═══════════════════════════════════════════════════════════════════════
 const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
@@ -65,17 +156,24 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   const boardContainerRef = useRef(null);
   const resizeStartRef = useRef({ x: 0, y: 0, size: 0 });
   
-  // Refs for storing function references (for use in useEffect with empty deps)
-  const makeEngineMoveRef = useRef(null);
-  const applyEngineMoveRef = useRef(null);
+  // Refs to store current state values for use in stockfish callback
+  const gameRef = useRef(game);
   const enemyRef = useRef(enemy);
   const playerColorRef = useRef(playerColor);
+  const gameStatusRef = useRef(gameStatus);
+  const onGameEndRef = useRef(onGameEnd);
   
-  // Keep refs updated
+  // Keep refs updated with current values
+  useEffect(() => {
+    gameRef.current = game;
+  }, [game]);
+  
   useEffect(() => {
     enemyRef.current = enemy;
     playerColorRef.current = playerColor;
-  }, [enemy, playerColor]);
+    gameStatusRef.current = gameStatus;
+    onGameEndRef.current = onGameEnd;
+  }, [enemy, playerColor, gameStatus, onGameEnd]);
 
   // Detect mobile device
   useEffect(() => {
@@ -93,124 +191,51 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     setBoardSize(initialSize);
   }, [isMobile]);
 
-  // Get engine settings based on enemy type - FULL personality configs
+  // Get engine settings based on enemy type - wrapper for component use
   const getEngineSettings = useCallback(() => {
-    switch (enemy?.id) {
-      case 'elegant':
-        return {
-          ...ELEGANT_CONFIG,
-          openings: ELEGANT_OPENINGS,
-          style: 'positional'
-        };
-      case 'nonelegant':
-        return {
-          ...NON_ELEGANT_CONFIG,
-          openings: NON_ELEGANT_OPENINGS,
-          style: 'aggressive'
-        };
-      case 'minia0':
-        return {
-          ...MINI_A0_CONFIG,
-          openings: MINI_A0_OPENINGS,
-          style: 'strategic'
-        };
-      default:
-        return {
-          ...ELEGANT_CONFIG,
-          openings: ELEGANT_OPENINGS,
-          style: 'balanced'
-        };
-    }
+    return getEngineSettingsForEnemy(enemy?.id);
   }, [enemy]);
 
-  // Get adaptive depth based on game phase and position type
+  // Get adaptive depth - wrapper for component use
   const getAdaptiveDepth = useCallback((currentFen, moveNumber) => {
-    const settings = getEngineSettings();
-    const phase = getGamePhase(moveNumber, currentFen);
-    const posType = analyzePositionType(currentFen);
-    
-    let depth = settings.baseDepth;
-    
-    if (phase === "opening") {
-      depth = settings.openingDepth;
-    } else if (phase === "endgame") {
-      depth = settings.endgameDepth;
-    } else if (phase === "middlegame" || phase === "late-middlegame") {
-      if (posType === "tactical") {
-        depth = settings.tacticalDepth;
-      } else if (posType === "positional") {
-        depth = settings.positionalDepth;
-      }
-    }
-    
-    return depth;
-  }, [getEngineSettings]);
+    return getAdaptiveDepthForPosition(currentFen, moveNumber, enemy?.id);
+  }, [enemy]);
 
-  // Get book move with WEIGHTED selection based on personality
+  // Get book move - wrapper for component use
   const getBookMove = useCallback((fen, color) => {
-    const settings = getEngineSettings();
-    
-    // Try multiple FEN key formats
-    const fenParts = fen.split(' ');
-    const fenKey1 = fenParts.slice(0, 4).join(' ');
-    const fenKey2 = fenParts.slice(0, 3).join(' ') + ' -';
-    const fenKey3 = fenParts[0] + ' ' + fenParts[1] + ' ' + fenParts[2] + ' -';
-    
-    let position = settings.openings[fenKey1] || settings.openings[fenKey2] || settings.openings[fenKey3];
-    
-    if (!position) return null;
-    
-    const moves = color === 'w' ? position.white : position.black;
-    if (!moves || moves.length === 0) return null;
-    
-    // Apply personality-specific aggression boost to first (most aggressive) option
-    const aggressionBoost = settings.aggressionFactor || 0.5;
-    let adjustedMoves = moves.map((m, idx) => ({
-      ...m,
-      weight: m.weight * (idx === 0 ? aggressionBoost + 0.15 : 1)
-    }));
-    
-    // Weighted random selection - THIS is the key personality difference!
-    const totalWeight = adjustedMoves.reduce((sum, m) => sum + m.weight, 0);
-    let random = Math.random() * totalWeight;
-    
-    for (let moveOption of adjustedMoves) {
-      random -= moveOption.weight;
-      if (random <= 0) return moveOption.move;
-    }
-    
-    return moves[0].move;
-  }, [getEngineSettings]);
+    return getBookMoveForPosition(fen, color, enemy?.id);
+  }, [enemy]);
 
-  // Initialize Stockfish - Simplified instant initialization (no retry/catch blocks)
+  // ═══════════════════════════════════════════════════════════════════════
+  // STOCKFISH ENGINE - Simplified instant initialization (no retry/catch)
   // Based on outdated engine.js pattern for reliable move generation
+  // ═══════════════════════════════════════════════════════════════════════
   useEffect(() => {
     // Create Web Worker for Stockfish - instant initialization
     stockfishRef.current = new Worker('/stockfish.js');
+    
+    // Pending callback for bestmove response
+    let pendingCallback = null;
     
     stockfishRef.current.onmessage = (event) => {
       const line = event.data;
       
       if (line === 'uciok') {
-        // Apply personality-specific settings after UCI confirmation
-        const settings = getEngineSettings();
-        const skillLevel = enemy?.id === 'minia0' ? 15 : 20;
-        stockfishRef.current.postMessage(`setoption name Skill Level value ${skillLevel}`);
-        stockfishRef.current.postMessage(`setoption name Contempt value ${settings.contempt || 24}`);
-        stockfishRef.current.postMessage(`setoption name MultiPV value 1`);
         stockfishRef.current.postMessage('isready');
       } else if (line === 'readyok') {
         isEngineReady.current = true;
-        // If playing black, engine makes first move
-        if (playerColor === 'black') {
-          setTimeout(() => makeEngineMove(new Chess()), 500);
+        // If player is black, engine (white) makes first move
+        if (playerColorRef.current === 'black') {
+          setTimeout(() => {
+            triggerEngineMove(new Chess());
+          }, 500);
         }
       } else if (line.startsWith('bestmove')) {
         const parts = line.split(' ');
         const bestMove = parts[1];
-        if (bestMove && bestMove !== '(none)' && pendingMove.current) {
-          pendingMove.current = false;
-          applyEngineMove(bestMove);
+        if (pendingCallback && bestMove && bestMove !== '(none)') {
+          pendingCallback(bestMove);
+          pendingCallback = null;
         }
         setIsThinking(false);
       }
@@ -218,19 +243,14 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     
     // Initialize UCI protocol
     stockfishRef.current.postMessage('uci');
+    // AlphaZero-style settings
+    stockfishRef.current.postMessage('setoption name Contempt value 50');
+    stockfishRef.current.postMessage('setoption name MultiPV value 1');
     
-    return () => {
-      if (stockfishRef.current) {
-        stockfishRef.current.terminate();
-      }
-    };
-  }, []);
-
-  // Apply engine's move to the game
-  const applyEngineMove = useCallback((moveStr) => {
-    setGame(prevGame => {
-      const gameCopy = new Chess(prevGame.fen());
-      try {
+    // Function to apply engine move to game state
+    function applyMoveToGame(moveStr) {
+      setGame(prevGame => {
+        const gameCopy = new Chess(prevGame.fen());
         const from = moveStr.substring(0, 2);
         const to = moveStr.substring(2, 4);
         const promotion = moveStr.length > 4 ? moveStr[4] : undefined;
@@ -254,51 +274,79 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
             }));
           }
           
+          // Check game over
           if (gameCopy.isGameOver()) {
-            handleGameOver(gameCopy);
+            let result;
+            if (gameCopy.isCheckmate()) {
+              const loser = gameCopy.turn();
+              const playerWon = (playerColorRef.current === 'white' && loser === 'b') || 
+                                (playerColorRef.current === 'black' && loser === 'w');
+              result = playerWon ? 'player' : 'enemy';
+            } else {
+              result = 'draw';
+            }
+            setGameStatus('ended');
+            setTimeout(() => onGameEndRef.current(result), 1500);
           }
+          
+          return gameCopy;
         }
-        return gameCopy;
-      } catch (e) {
-        console.error('Invalid engine move:', moveStr, e);
         return prevGame;
-      }
-    });
-  }, []);
-
-  // Make the engine move with ADAPTIVE depth based on personality and game phase
-  const makeEngineMove = useCallback((currentGame) => {
-    if (!stockfishRef.current || !isEngineReady.current) return;
-    if (currentGame.isGameOver()) return;
-    
-    const settings = getEngineSettings();
-    const engineColor = playerColor === 'white' ? 'b' : 'w';
-    const currentMoveNumber = currentGame.moveNumber();
-    const currentFen = currentGame.fen();
-    
-    // Try book move first in opening phase (extended for different personalities)
-    const openingBookDepth = enemy?.id === 'minia0' ? 12 : (enemy?.id === 'elegant' ? 10 : 8);
-    if (currentMoveNumber <= openingBookDepth) {
-      const bookMove = getBookMove(currentFen, engineColor);
-      if (bookMove) {
-        // Personality-based thinking time variation
-        const minTime = settings.thinkingTimeMin || 150;
-        const maxTime = settings.thinkingTimeMax || 800;
-        const thinkTime = minTime + Math.random() * (maxTime - minTime) * (settings.openingSpeed || 0.5);
-        setTimeout(() => applyEngineMove(bookMove), thinkTime);
-        return;
-      }
+      });
     }
     
-    setIsThinking(true);
-    pendingMove.current = true;
+    // Function to trigger engine to calculate and make a move
+    function triggerEngineMove(currentGame) {
+      if (!stockfishRef.current || !isEngineReady.current) return;
+      if (currentGame.isGameOver()) return;
+      
+      const currentEnemyId = enemyRef.current?.id;
+      const currentPlayerColor = playerColorRef.current;
+      const settings = getEngineSettingsForEnemy(currentEnemyId);
+      const engineColor = currentPlayerColor === 'white' ? 'b' : 'w';
+      const currentMoveNumber = currentGame.moveNumber();
+      const currentFen = currentGame.fen();
+      
+      // Try book move first in opening phase
+      const openingBookDepth = currentEnemyId === 'minia0' ? 12 : (currentEnemyId === 'elegant' ? 10 : 8);
+      if (currentMoveNumber <= openingBookDepth) {
+        const bookMove = getBookMoveForPosition(currentFen, engineColor, currentEnemyId);
+        if (bookMove) {
+          // Personality-based thinking time variation
+          const minTime = settings.thinkingTimeMin || 150;
+          const maxTime = settings.thinkingTimeMax || 800;
+          const thinkTime = minTime + Math.random() * (maxTime - minTime) * (settings.openingSpeed || 0.5);
+          setTimeout(() => applyMoveToGame(bookMove), thinkTime);
+          return;
+        }
+      }
+      
+      setIsThinking(true);
+      
+      // Use ADAPTIVE depth based on game phase and position type
+      const adaptiveDepth = getAdaptiveDepthForPosition(currentFen, currentMoveNumber, currentEnemyId);
+      
+      // Apply personality-specific engine settings before search
+      const skillLevel = currentEnemyId === 'minia0' ? 15 : 20;
+      stockfishRef.current.postMessage(`setoption name Skill Level value ${skillLevel}`);
+      stockfishRef.current.postMessage(`setoption name Contempt value ${settings.contempt || 24}`);
+      
+      // Set callback for when bestmove is received
+      pendingCallback = applyMoveToGame;
+      
+      stockfishRef.current.postMessage(`position fen ${currentFen}`);
+      stockfishRef.current.postMessage(`go depth ${adaptiveDepth}`);
+    }
     
-    // Use ADAPTIVE depth based on game phase and position type
-    const adaptiveDepth = getAdaptiveDepth(currentFen, currentMoveNumber);
+    // Store triggerEngineMove in a ref so it can be called from outside
+    stockfishRef.current.triggerEngineMove = triggerEngineMove;
     
-    stockfishRef.current.postMessage(`position fen ${currentFen}`);
-    stockfishRef.current.postMessage(`go depth ${adaptiveDepth}`);
-  }, [getEngineSettings, playerColor, getBookMove, applyEngineMove, getAdaptiveDepth, enemy]);
+    return () => {
+      if (stockfishRef.current) {
+        stockfishRef.current.terminate();
+      }
+    };
+  }, []);
 
   // Handle game over
   const handleGameOver = (gameInstance) => {
@@ -354,7 +402,12 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         return true;
       }
       
-      setTimeout(() => makeEngineMove(gameCopy), 300);
+      // Trigger engine to make its move
+      setTimeout(() => {
+        if (stockfishRef.current?.triggerEngineMove) {
+          stockfishRef.current.triggerEngineMove(gameCopy);
+        }
+      }, 300);
       return true;
     } catch (e) {
       return false;
@@ -372,7 +425,11 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     setCapturedPieces({ white: [], black: [] });
     
     if (playerColor === 'black') {
-      setTimeout(() => makeEngineMove(newGame), 500);
+      setTimeout(() => {
+        if (stockfishRef.current?.triggerEngineMove) {
+          stockfishRef.current.triggerEngineMove(newGame);
+        }
+      }, 500);
     }
   };
 
