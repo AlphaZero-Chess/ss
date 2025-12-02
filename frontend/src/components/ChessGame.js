@@ -1,0 +1,736 @@
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Chessboard } from 'react-chessboard';
+import { Chess } from 'chess.js';
+import { ArrowLeft, RotateCcw, Flag, Zap, Maximize2, Minimize2, Move } from 'lucide-react';
+
+// ═══════════════════════════════════════════════════════════════════════
+// PERSONALITY IMPORTS - External personality files
+// Each personality has unique CONFIG and OPENINGS
+// ═══════════════════════════════════════════════════════════════════════
+import { ELEGANT_CONFIG, ELEGANT_OPENINGS } from '../personalities/elegant';
+import { NON_ELEGANT_CONFIG, NON_ELEGANT_OPENINGS } from '../personalities/nonelegant';
+import { MINI_A0_CONFIG, MINI_A0_OPENINGS } from '../personalities/minia0';
+
+// ═══════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS - Piece counting and game phase detection
+// ═══════════════════════════════════════════════════════════════════════
+function countPieces(fen) {
+  let count = 0;
+  const board = fen.split(' ')[0];
+  for (let i = 0; i < board.length; i++) {
+    const char = board[i];
+    if ((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z')) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function getGamePhase(moveNum, fen) {
+  const pieces = countPieces(fen);
+  if (moveNum <= 8) return "opening";
+  if (moveNum <= 14 && pieces > 28) return "early-middlegame";
+  if (pieces > 22) return "middlegame";
+  if (pieces > 14) return "late-middlegame";
+  return "endgame";
+}
+
+function analyzePositionType(fen) {
+  if (fen.indexOf("+") !== -1) return "tactical";
+  
+  const board = fen.split(' ')[0];
+  if (board.indexOf("pp") !== -1 || board.indexOf("PP") !== -1) {
+    return "positional";
+  }
+  return "normal";
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CHESS GAME COMPONENT
+// ═══════════════════════════════════════════════════════════════════════
+const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
+  const [game, setGame] = useState(new Chess());
+  const [position, setPosition] = useState('start');
+  const [isThinking, setIsThinking] = useState(false);
+  const [moveHistory, setMoveHistory] = useState([]);
+  const [gameStatus, setGameStatus] = useState('playing');
+  const [lastMove, setLastMove] = useState(null);
+  const [capturedPieces, setCapturedPieces] = useState({ white: [], black: [] });
+  const [boardSize, setBoardSize] = useState(280);
+  const [isResizing, setIsResizing] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const stockfishRef = useRef(null);
+  const isEngineReady = useRef(false);
+  const pendingMove = useRef(false);
+  const boardContainerRef = useRef(null);
+  const resizeStartRef = useRef({ x: 0, y: 0, size: 0 });
+
+  // Detect mobile device
+  useEffect(() => {
+    const checkMobile = () => {
+      setIsMobile(window.innerWidth <= 768);
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  // Set initial board size based on device
+  useEffect(() => {
+    const initialSize = isMobile ? Math.min(280, window.innerWidth - 40) : 320;
+    setBoardSize(initialSize);
+  }, [isMobile]);
+
+  // Get engine settings based on enemy type - FULL personality configs
+  const getEngineSettings = useCallback(() => {
+    switch (enemy?.id) {
+      case 'elegant':
+        return {
+          ...ELEGANT_CONFIG,
+          openings: ELEGANT_OPENINGS,
+          style: 'positional'
+        };
+      case 'nonelegant':
+        return {
+          ...NON_ELEGANT_CONFIG,
+          openings: NON_ELEGANT_OPENINGS,
+          style: 'aggressive'
+        };
+      case 'minia0':
+        return {
+          ...MINI_A0_CONFIG,
+          openings: MINI_A0_OPENINGS,
+          style: 'strategic'
+        };
+      default:
+        return {
+          ...ELEGANT_CONFIG,
+          openings: ELEGANT_OPENINGS,
+          style: 'balanced'
+        };
+    }
+  }, [enemy]);
+
+  // Get adaptive depth based on game phase and position type
+  const getAdaptiveDepth = useCallback((currentFen, moveNumber) => {
+    const settings = getEngineSettings();
+    const phase = getGamePhase(moveNumber, currentFen);
+    const posType = analyzePositionType(currentFen);
+    
+    let depth = settings.baseDepth;
+    
+    if (phase === "opening") {
+      depth = settings.openingDepth;
+    } else if (phase === "endgame") {
+      depth = settings.endgameDepth;
+    } else if (phase === "middlegame" || phase === "late-middlegame") {
+      if (posType === "tactical") {
+        depth = settings.tacticalDepth;
+      } else if (posType === "positional") {
+        depth = settings.positionalDepth;
+      }
+    }
+    
+    return depth;
+  }, [getEngineSettings]);
+
+  // Get book move with WEIGHTED selection based on personality
+  const getBookMove = useCallback((fen, color) => {
+    const settings = getEngineSettings();
+    
+    // Try multiple FEN key formats
+    const fenParts = fen.split(' ');
+    const fenKey1 = fenParts.slice(0, 4).join(' ');
+    const fenKey2 = fenParts.slice(0, 3).join(' ') + ' -';
+    const fenKey3 = fenParts[0] + ' ' + fenParts[1] + ' ' + fenParts[2] + ' -';
+    
+    let position = settings.openings[fenKey1] || settings.openings[fenKey2] || settings.openings[fenKey3];
+    
+    if (!position) return null;
+    
+    const moves = color === 'w' ? position.white : position.black;
+    if (!moves || moves.length === 0) return null;
+    
+    // Apply personality-specific aggression boost to first (most aggressive) option
+    const aggressionBoost = settings.aggressionFactor || 0.5;
+    let adjustedMoves = moves.map((m, idx) => ({
+      ...m,
+      weight: m.weight * (idx === 0 ? aggressionBoost + 0.15 : 1)
+    }));
+    
+    // Weighted random selection - THIS is the key personality difference!
+    const totalWeight = adjustedMoves.reduce((sum, m) => sum + m.weight, 0);
+    let random = Math.random() * totalWeight;
+    
+    for (let moveOption of adjustedMoves) {
+      random -= moveOption.weight;
+      if (random <= 0) return moveOption.move;
+    }
+    
+    return moves[0].move;
+  }, [getEngineSettings]);
+
+  // Initialize Stockfish with personality-specific settings
+  useEffect(() => {
+    const initEngine = async () => {
+      try {
+        stockfishRef.current = new Worker('/stockfish.js');
+        
+        stockfishRef.current.onmessage = (event) => {
+          const message = event.data;
+          
+          if (message === 'uciok') {
+            const settings = getEngineSettings();
+            // Apply personality-specific engine settings
+            const skillLevel = enemy?.id === 'minia0' ? 15 : 20;
+            stockfishRef.current.postMessage(`setoption name Skill Level value ${skillLevel}`);
+            stockfishRef.current.postMessage(`setoption name Contempt value ${settings.contempt || 24}`);
+            stockfishRef.current.postMessage(`setoption name MultiPV value 1`);
+            stockfishRef.current.postMessage('isready');
+          }
+          
+          if (message === 'readyok') {
+            isEngineReady.current = true;
+            if (playerColor === 'black') {
+              setTimeout(() => makeEngineMove(new Chess()), 500);
+            }
+          }
+          
+          if (message.startsWith('bestmove')) {
+            const move = message.split(' ')[1];
+            if (move && move !== '(none)' && pendingMove.current) {
+              pendingMove.current = false;
+              applyEngineMove(move);
+            }
+            setIsThinking(false);
+          }
+        };
+        
+        stockfishRef.current.postMessage('uci');
+      } catch (error) {
+        console.error('Failed to initialize Stockfish:', error);
+      }
+    };
+
+    initEngine();
+
+    return () => {
+      if (stockfishRef.current) {
+        stockfishRef.current.terminate();
+      }
+    };
+  }, [playerColor, getEngineSettings, enemy]);
+
+  // Apply engine's move to the game
+  const applyEngineMove = useCallback((moveStr) => {
+    setGame(prevGame => {
+      const gameCopy = new Chess(prevGame.fen());
+      try {
+        const from = moveStr.substring(0, 2);
+        const to = moveStr.substring(2, 4);
+        const promotion = moveStr.length > 4 ? moveStr[4] : undefined;
+        
+        const moveResult = gameCopy.move({
+          from,
+          to,
+          promotion: promotion || 'q'
+        });
+        
+        if (moveResult) {
+          setPosition(gameCopy.fen());
+          setMoveHistory(prev => [...prev, moveResult.san]);
+          setLastMove({ from, to });
+          
+          if (moveResult.captured) {
+            const capturedColor = moveResult.color === 'w' ? 'black' : 'white';
+            setCapturedPieces(prev => ({
+              ...prev,
+              [capturedColor]: [...prev[capturedColor], moveResult.captured]
+            }));
+          }
+          
+          if (gameCopy.isGameOver()) {
+            handleGameOver(gameCopy);
+          }
+        }
+        return gameCopy;
+      } catch (e) {
+        console.error('Invalid engine move:', moveStr, e);
+        return prevGame;
+      }
+    });
+  }, []);
+
+  // Make the engine move with ADAPTIVE depth based on personality and game phase
+  const makeEngineMove = useCallback((currentGame) => {
+    if (!stockfishRef.current || !isEngineReady.current) return;
+    if (currentGame.isGameOver()) return;
+    
+    const settings = getEngineSettings();
+    const engineColor = playerColor === 'white' ? 'b' : 'w';
+    const currentMoveNumber = currentGame.moveNumber();
+    const currentFen = currentGame.fen();
+    
+    // Try book move first in opening phase (extended for different personalities)
+    const openingBookDepth = enemy?.id === 'minia0' ? 12 : (enemy?.id === 'elegant' ? 10 : 8);
+    if (currentMoveNumber <= openingBookDepth) {
+      const bookMove = getBookMove(currentFen, engineColor);
+      if (bookMove) {
+        // Personality-based thinking time variation
+        const minTime = settings.thinkingTimeMin || 150;
+        const maxTime = settings.thinkingTimeMax || 800;
+        const thinkTime = minTime + Math.random() * (maxTime - minTime) * (settings.openingSpeed || 0.5);
+        setTimeout(() => applyEngineMove(bookMove), thinkTime);
+        return;
+      }
+    }
+    
+    setIsThinking(true);
+    pendingMove.current = true;
+    
+    // Use ADAPTIVE depth based on game phase and position type
+    const adaptiveDepth = getAdaptiveDepth(currentFen, currentMoveNumber);
+    
+    stockfishRef.current.postMessage(`position fen ${currentFen}`);
+    stockfishRef.current.postMessage(`go depth ${adaptiveDepth}`);
+  }, [getEngineSettings, playerColor, getBookMove, applyEngineMove, getAdaptiveDepth, enemy]);
+
+  // Handle game over
+  const handleGameOver = (gameInstance) => {
+    let result;
+    if (gameInstance.isCheckmate()) {
+      const loser = gameInstance.turn();
+      const playerWon = (playerColor === 'white' && loser === 'b') || 
+                        (playerColor === 'black' && loser === 'w');
+      result = playerWon ? 'player' : 'enemy';
+    } else if (gameInstance.isDraw() || gameInstance.isStalemate()) {
+      result = 'draw';
+    }
+    
+    setGameStatus('ended');
+    setTimeout(() => onGameEnd(result), 1500);
+  };
+
+  // Handle player move
+  const onDrop = (sourceSquare, targetSquare, piece) => {
+    if (isThinking || gameStatus !== 'playing') return false;
+    
+    const turn = game.turn();
+    const isPlayerTurn = (playerColor === 'white' && turn === 'w') || 
+                         (playerColor === 'black' && turn === 'b');
+    
+    if (!isPlayerTurn) return false;
+    
+    try {
+      const gameCopy = new Chess(game.fen());
+      const moveResult = gameCopy.move({
+        from: sourceSquare,
+        to: targetSquare,
+        promotion: 'q'
+      });
+      
+      if (moveResult === null) return false;
+      
+      setGame(gameCopy);
+      setPosition(gameCopy.fen());
+      setMoveHistory(prev => [...prev, moveResult.san]);
+      setLastMove({ from: sourceSquare, to: targetSquare });
+      
+      if (moveResult.captured) {
+        const capturedColor = moveResult.color === 'w' ? 'black' : 'white';
+        setCapturedPieces(prev => ({
+          ...prev,
+          [capturedColor]: [...prev[capturedColor], moveResult.captured]
+        }));
+      }
+      
+      if (gameCopy.isGameOver()) {
+        handleGameOver(gameCopy);
+        return true;
+      }
+      
+      setTimeout(() => makeEngineMove(gameCopy), 300);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  // Reset game
+  const resetGame = () => {
+    const newGame = new Chess();
+    setGame(newGame);
+    setPosition('start');
+    setMoveHistory([]);
+    setGameStatus('playing');
+    setLastMove(null);
+    setCapturedPieces({ white: [], black: [] });
+    
+    if (playerColor === 'black') {
+      setTimeout(() => makeEngineMove(newGame), 500);
+    }
+  };
+
+  // Resign
+  const handleResign = () => {
+    setGameStatus('ended');
+    onGameEnd('enemy');
+  };
+
+  // Resize handlers
+  const handleResizeStart = (e) => {
+    e.preventDefault();
+    const clientX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
+    const clientY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
+    resizeStartRef.current = { x: clientX, y: clientY, size: boardSize };
+    setIsResizing(true);
+  };
+
+  const handleResizeMove = useCallback((e) => {
+    if (!isResizing) return;
+    const clientX = e.type.includes('touch') ? e.touches[0].clientX : e.clientX;
+    const clientY = e.type.includes('touch') ? e.touches[0].clientY : e.clientY;
+    
+    const deltaX = clientX - resizeStartRef.current.x;
+    const deltaY = clientY - resizeStartRef.current.y;
+    const delta = Math.max(deltaX, deltaY);
+    
+    const minSize = isMobile ? 200 : 240;
+    const maxSize = isMobile ? Math.min(400, window.innerWidth - 40) : 600;
+    const newSize = Math.max(minSize, Math.min(maxSize, resizeStartRef.current.size + delta));
+    setBoardSize(newSize);
+  }, [isResizing, isMobile]);
+
+  const handleResizeEnd = useCallback(() => {
+    setIsResizing(false);
+  }, []);
+
+  useEffect(() => {
+    if (isResizing) {
+      window.addEventListener('mousemove', handleResizeMove);
+      window.addEventListener('mouseup', handleResizeEnd);
+      window.addEventListener('touchmove', handleResizeMove);
+      window.addEventListener('touchend', handleResizeEnd);
+    }
+    return () => {
+      window.removeEventListener('mousemove', handleResizeMove);
+      window.removeEventListener('mouseup', handleResizeEnd);
+      window.removeEventListener('touchmove', handleResizeMove);
+      window.removeEventListener('touchend', handleResizeEnd);
+    };
+  }, [isResizing, handleResizeMove, handleResizeEnd]);
+
+  // Quick size buttons
+  const setSmallSize = () => setBoardSize(isMobile ? 220 : 280);
+  const setLargeSize = () => setBoardSize(isMobile ? 340 : 480);
+
+  // Get piece symbols for captured display
+  const getPieceSymbol = (piece, color) => {
+    const symbols = {
+      white: { p: '♙', n: '♘', b: '♗', r: '♖', q: '♕' },
+      black: { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛' }
+    };
+    return symbols[color]?.[piece] || '';
+  };
+
+  // Custom square styles for last move highlight
+  const customSquareStyles = {};
+  if (lastMove) {
+    customSquareStyles[lastMove.from] = {
+      backgroundColor: 'rgba(255, 255, 0, 0.35)'
+    };
+    customSquareStyles[lastMove.to] = {
+      backgroundColor: 'rgba(255, 255, 0, 0.35)'
+    };
+  }
+
+  const isPlayerTurn = (playerColor === 'white' && game.turn() === 'w') || 
+                       (playerColor === 'black' && game.turn() === 'b');
+
+  return (
+    <div className="min-h-screen w-full flex flex-col items-center justify-center p-2 sm:p-4 relative overflow-hidden" data-testid="chess-game-container">
+      {/* Background */}
+      <div className="absolute inset-0 bg-gradient-to-br from-gray-900 via-purple-900/20 to-gray-900" />
+
+      {/* Main Layout */}
+      <div className={`relative z-10 flex ${isMobile ? 'flex-col' : 'flex-row'} items-start justify-center gap-3 sm:gap-6 w-full max-w-6xl`}>
+        
+        {/* Game Info Panel - Compact for mobile */}
+        <div className={`${isMobile ? 'w-full max-w-sm mx-auto order-2' : 'w-56 flex-shrink-0'}`}>
+          <div 
+            className="rounded-lg p-3 sm:p-4"
+            style={{
+              background: 'linear-gradient(180deg, rgba(20,20,35,0.9) 0%, rgba(10,10,20,0.95) 100%)',
+              border: `1px solid ${enemy?.color || '#ff0080'}30`,
+              backdropFilter: 'blur(10px)'
+            }}
+          >
+            {/* Enemy Info */}
+            <div className="flex items-center gap-3 mb-3 pb-3 border-b border-white/10">
+              <span className="text-2xl sm:text-3xl" style={{ filter: `drop-shadow(0 0 8px ${enemy?.color})` }}>
+                {enemy?.avatar}
+              </span>
+              <div>
+                <h3 
+                  className="text-sm sm:text-base font-bold tracking-wide"
+                  style={{ fontFamily: 'Orbitron, sans-serif', color: enemy?.color }}
+                >
+                  {enemy?.name}
+                </h3>
+                <p className="text-xs text-gray-500" style={{ fontFamily: 'Rajdhani, sans-serif' }}>
+                  {enemy?.difficulty}
+                </p>
+              </div>
+            </div>
+
+            {/* Turn Indicator */}
+            <div className="mb-3">
+              <div 
+                className={`flex items-center justify-center gap-2 py-2 px-3 rounded-lg transition-all duration-300 ${isThinking ? 'animate-pulse' : ''}`}
+                style={{
+                  background: isPlayerTurn 
+                    ? 'linear-gradient(135deg, #00ff8830 0%, #00ff4415 100%)'
+                    : `linear-gradient(135deg, ${enemy?.color}30 0%, ${enemy?.color}15 100%)`,
+                  border: `1px solid ${isPlayerTurn ? '#00ff8850' : enemy?.color + '50'}`
+                }}
+              >
+                {isThinking ? (
+                  <>
+                    <Zap size={14} className="animate-pulse" style={{ color: enemy?.color }} />
+                    <span style={{ fontFamily: 'Orbitron, sans-serif', color: enemy?.color, fontSize: '11px' }}>
+                      THINKING...
+                    </span>
+                  </>
+                ) : (
+                  <span 
+                    style={{ 
+                      fontFamily: 'Orbitron, sans-serif', 
+                      color: isPlayerTurn ? '#00ff88' : enemy?.color,
+                      fontSize: '11px'
+                    }}
+                  >
+                    {isPlayerTurn ? 'YOUR TURN' : 'OPPONENT'}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Captured Pieces */}
+            <div className="mb-3">
+              <h4 className="text-xs text-gray-500 mb-1" style={{ fontFamily: 'Rajdhani, sans-serif' }}>
+                CAPTURED
+              </h4>
+              <div className="flex flex-wrap gap-0.5 min-h-[22px] p-1.5 rounded bg-black/30 text-sm">
+                {capturedPieces[playerColor === 'white' ? 'black' : 'white'].map((piece, i) => (
+                  <span key={i}>{getPieceSymbol(piece, playerColor === 'white' ? 'black' : 'white')}</span>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-0.5 min-h-[22px] p-1.5 rounded bg-white/5 mt-1 text-sm">
+                {capturedPieces[playerColor].map((piece, i) => (
+                  <span key={i}>{getPieceSymbol(piece, playerColor)}</span>
+                ))}
+              </div>
+            </div>
+
+            {/* Control Buttons */}
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                data-testid="back-btn"
+                onClick={onBack}
+                className="flex items-center justify-center gap-1 py-1.5 px-3 rounded bg-white/10 hover:bg-white/20 transition-all text-xs"
+                style={{ fontFamily: 'Orbitron, sans-serif' }}
+              >
+                <ArrowLeft size={12} />
+                BACK
+              </button>
+              <button
+                data-testid="reset-btn"
+                onClick={resetGame}
+                className="flex items-center justify-center gap-1 py-1.5 px-3 rounded bg-blue-500/20 hover:bg-blue-500/40 text-blue-400 transition-all text-xs"
+                style={{ fontFamily: 'Orbitron, sans-serif' }}
+              >
+                <RotateCcw size={12} />
+                RESET
+              </button>
+              <button
+                data-testid="resign-btn"
+                onClick={handleResign}
+                className="flex items-center justify-center gap-1 py-1.5 px-3 rounded bg-red-500/20 hover:bg-red-500/40 text-red-400 transition-all text-xs"
+                style={{ fontFamily: 'Orbitron, sans-serif' }}
+              >
+                <Flag size={12} />
+                RESIGN
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Chess Board with Resize Handle */}
+        <div className={`relative ${isMobile ? 'order-1' : ''}`} ref={boardContainerRef}>
+          {/* Board Container */}
+          <div 
+            className="chess-board-wrapper p-1.5 rounded-lg relative"
+            style={{
+              background: 'linear-gradient(180deg, rgba(25,25,40,0.85) 0%, rgba(15,15,25,0.9) 100%)',
+              boxShadow: `0 0 30px ${enemy?.color}20, 0 0 60px ${enemy?.color}08`,
+              border: `1px solid ${enemy?.color}25`,
+              backdropFilter: 'blur(8px)',
+              width: boardSize + 12,
+              height: boardSize + 12,
+            }}
+            data-testid="chess-board-container"
+          >
+            <Chessboard
+              id="chess-board"
+              position={position}
+              onPieceDrop={onDrop}
+              boardWidth={boardSize}
+              boardOrientation={playerColor}
+              customBoardStyle={{
+                borderRadius: '6px',
+                boxShadow: 'inset 0 0 15px rgba(0,0,0,0.4)'
+              }}
+              customSquareStyles={customSquareStyles}
+              customDarkSquareStyle={{ backgroundColor: '#4a5568' }}
+              customLightSquareStyle={{ backgroundColor: '#a0aec0' }}
+              animationDuration={180}
+            />
+            
+            {/* Resize Handle - Bottom Right Corner */}
+            <div
+              className="absolute bottom-0 right-0 w-6 h-6 cursor-se-resize flex items-center justify-center opacity-40 hover:opacity-80 transition-opacity"
+              style={{ 
+                background: `linear-gradient(135deg, transparent 50%, ${enemy?.color || '#ff0080'}60 50%)`,
+                borderBottomRightRadius: '6px'
+              }}
+              onMouseDown={handleResizeStart}
+              onTouchStart={handleResizeStart}
+              data-testid="resize-handle"
+            >
+              <Move size={10} className="text-white/50 rotate-45" style={{ marginTop: '4px', marginLeft: '4px' }} />
+            </div>
+          </div>
+          
+          {/* Size Controls */}
+          <div className="flex justify-center gap-2 mt-2">
+            <button
+              onClick={setSmallSize}
+              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-white/10 hover:bg-white/20 transition-all"
+              style={{ fontFamily: 'Rajdhani, sans-serif' }}
+              data-testid="size-small-btn"
+            >
+              <Minimize2 size={12} />
+              Small
+            </button>
+            <span className="text-xs text-gray-500 flex items-center" style={{ fontFamily: 'Rajdhani, sans-serif' }}>
+              {boardSize}px
+            </span>
+            <button
+              onClick={setLargeSize}
+              className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-white/10 hover:bg-white/20 transition-all"
+              style={{ fontFamily: 'Rajdhani, sans-serif' }}
+              data-testid="size-large-btn"
+            >
+              <Maximize2 size={12} />
+              Large
+            </button>
+          </div>
+          
+          {/* Check indicator */}
+          {game.isCheck() && !game.isCheckmate() && (
+            <div 
+              className="absolute -top-8 left-1/2 -translate-x-1/2 px-4 py-1 rounded-full text-xs"
+              style={{
+                background: 'linear-gradient(135deg, #ff0040 0%, #ff4000 100%)',
+                fontFamily: 'Orbitron, sans-serif',
+                animation: 'pulse 1s infinite'
+              }}
+            >
+              CHECK!
+            </div>
+          )}
+        </div>
+
+        {/* Move History Panel - Compact */}
+        <div className={`${isMobile ? 'w-full max-w-sm mx-auto order-3' : 'w-48 flex-shrink-0'}`}>
+          <div 
+            className="rounded-lg p-3 sm:p-4"
+            style={{
+              background: 'linear-gradient(180deg, rgba(20,20,35,0.9) 0%, rgba(10,10,20,0.95) 100%)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              backdropFilter: 'blur(10px)'
+            }}
+          >
+            <h3 
+              className="text-xs font-bold tracking-wider mb-2 text-gray-400"
+              style={{ fontFamily: 'Orbitron, sans-serif' }}
+            >
+              MOVES
+            </h3>
+            
+            <div 
+              className={`${isMobile ? 'h-24' : 'h-48'} overflow-y-auto pr-1 custom-scrollbar`}
+              style={{ fontFamily: 'Rajdhani, sans-serif' }}
+            >
+              {moveHistory.length === 0 ? (
+                <p className="text-gray-600 text-xs">No moves yet</p>
+              ) : (
+                <div className="space-y-0.5 text-xs">
+                  {Array.from({ length: Math.ceil(moveHistory.length / 2) }).map((_, i) => (
+                    <div 
+                      key={i} 
+                      className="flex items-center gap-1 py-0.5 px-1.5 rounded hover:bg-white/5"
+                    >
+                      <span className="text-gray-600 w-4">{i + 1}.</span>
+                      <span className="text-white flex-1">{moveHistory[i * 2]}</span>
+                      <span className="text-gray-400 flex-1">{moveHistory[i * 2 + 1] || ''}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Player Color Indicator */}
+            <div className="mt-2 pt-2 border-t border-white/10">
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-gray-500" style={{ fontFamily: 'Rajdhani, sans-serif' }}>
+                  PLAYING AS
+                </span>
+                <span 
+                  className="text-xl"
+                  style={{ filter: 'drop-shadow(0 0 4px rgba(255,255,255,0.4))' }}
+                >
+                  {playerColor === 'white' ? '♔' : '♚'}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Custom scrollbar styles */}
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 3px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: rgba(255,255,255,0.03);
+          border-radius: 2px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: rgba(255,255,255,0.15);
+          border-radius: 2px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: rgba(255,255,255,0.25);
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.6; }
+        }
+      `}</style>
+    </div>
+  );
+};
+
+export default ChessGame;
