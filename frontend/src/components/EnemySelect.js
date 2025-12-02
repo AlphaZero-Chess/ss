@@ -54,7 +54,7 @@ const enemies = [
 
 const EnemySelect = ({ onSelect }) => {
   const [hoveredEnemy, setHoveredEnemy] = useState(null);
-  const [selectedIndex, setSelectedIndex] = useState(1);
+  const [selectedIndex, setSelectedIndex] = useState(null);
   const [isReady, setIsReady] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
 
