@@ -140,8 +140,11 @@ function getBookMoveForPosition(fen, color, enemyId) {
 // CHESS GAME COMPONENT
 // ═══════════════════════════════════════════════════════════════════════
 const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
-  const [game, setGame] = useState(new Chess());
-  const [position, setPosition] = useState('start');
+  // Initialize game state - create initial Chess instance once
+  const [gameInstance] = useState(() => new Chess());
+  const gameRef = useRef(gameInstance);
+  // Position as FEN string - this drives the visual board
+  const [position, setPosition] = useState(() => new Chess().fen());
   const [isThinking, setIsThinking] = useState(false);
   const [moveHistory, setMoveHistory] = useState([]);
   const [gameStatus, setGameStatus] = useState('playing');
@@ -150,24 +153,21 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   const [boardSize, setBoardSize] = useState(280);
   const [isResizing, setIsResizing] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+  const [currentTurn, setCurrentTurn] = useState('w'); // Track current turn for UI
+  const [isInCheck, setIsInCheck] = useState(false); // Track check state
   const stockfishRef = useRef(null);
   const isEngineReady = useRef(false);
-  const pendingMove = useRef(false);
   const boardContainerRef = useRef(null);
   const resizeStartRef = useRef({ x: 0, y: 0, size: 0 });
+  const moveCountRef = useRef(0);
   
-  // Refs to store current state values for use in stockfish callback
-  const gameRef = useRef(game);
+  // Refs to store props for use in stockfish callback (avoid stale closures)
   const enemyRef = useRef(enemy);
   const playerColorRef = useRef(playerColor);
   const gameStatusRef = useRef(gameStatus);
   const onGameEndRef = useRef(onGameEnd);
   
   // Keep refs updated with current values
-  useEffect(() => {
-    gameRef.current = game;
-  }, [game]);
-  
   useEffect(() => {
     enemyRef.current = enemy;
     playerColorRef.current = playerColor;
@@ -207,11 +207,10 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   }, [enemy]);
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STOCKFISH ENGINE - Simplified instant initialization (no retry/catch)
-  // Based on outdated engine.js pattern for reliable move generation
+  // STOCKFISH ENGINE - Based on reference engine.js pattern
   // ═══════════════════════════════════════════════════════════════════════
   useEffect(() => {
-    // Create Web Worker for Stockfish - instant initialization
+    // Create Web Worker for Stockfish
     stockfishRef.current = new Worker('/stockfish.js');
     
     // Pending callback for bestmove response
@@ -224,15 +223,17 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         stockfishRef.current.postMessage('isready');
       } else if (line === 'readyok') {
         isEngineReady.current = true;
+        console.log('Stockfish engine ready');
         // If player is black, engine (white) makes first move
         if (playerColorRef.current === 'black') {
           setTimeout(() => {
-            triggerEngineMove(new Chess());
+            makeEngineMove();
           }, 500);
         }
       } else if (line.startsWith('bestmove')) {
         const parts = line.split(' ');
         const bestMove = parts[1];
+        console.log('Engine bestmove:', bestMove);
         if (pendingCallback && bestMove && bestMove !== '(none)') {
           pendingCallback(bestMove);
           pendingCallback = null;
@@ -243,26 +244,30 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     
     // Initialize UCI protocol
     stockfishRef.current.postMessage('uci');
-    // AlphaZero-style settings
     stockfishRef.current.postMessage('setoption name Contempt value 50');
     stockfishRef.current.postMessage('setoption name MultiPV value 1');
     
-    // Function to apply engine move to game state
-    function applyMoveToGame(moveStr) {
-      setGame(prevGame => {
-        const gameCopy = new Chess(prevGame.fen());
-        const from = moveStr.substring(0, 2);
-        const to = moveStr.substring(2, 4);
-        const promotion = moveStr.length > 4 ? moveStr[4] : undefined;
-        
-        const moveResult = gameCopy.move({
+    // Function to apply engine move to the game
+    function applyEngineMove(moveStr) {
+      const game = gameRef.current;
+      const from = moveStr.substring(0, 2);
+      const to = moveStr.substring(2, 4);
+      const promotion = moveStr.length > 4 ? moveStr[4] : undefined;
+      
+      try {
+        const moveResult = game.move({
           from,
           to,
           promotion: promotion || 'q'
         });
         
         if (moveResult) {
-          setPosition(gameCopy.fen());
+          moveCountRef.current++;
+          // Update all state synchronously
+          const newFen = game.fen();
+          setPosition(newFen);
+          setCurrentTurn(game.turn());
+          setIsInCheck(game.isCheck() && !game.isCheckmate());
           setMoveHistory(prev => [...prev, moveResult.san]);
           setLastMove({ from, to });
           
@@ -275,10 +280,10 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
           }
           
           // Check game over
-          if (gameCopy.isGameOver()) {
+          if (game.isGameOver()) {
             let result;
-            if (gameCopy.isCheckmate()) {
-              const loser = gameCopy.turn();
+            if (game.isCheckmate()) {
+              const loser = game.turn();
               const playerWon = (playerColorRef.current === 'white' && loser === 'b') || 
                                 (playerColorRef.current === 'black' && loser === 'w');
               result = playerWon ? 'player' : 'enemy';
@@ -289,57 +294,68 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
             setTimeout(() => onGameEndRef.current(result), 1500);
           }
           
-          return gameCopy;
+          console.log('Engine move applied:', moveResult.san, 'Position:', newFen);
         }
-        return prevGame;
-      });
+      } catch (e) {
+        console.error('Engine move error:', e);
+      }
     }
     
     // Function to trigger engine to calculate and make a move
-    function triggerEngineMove(currentGame) {
-      if (!stockfishRef.current || !isEngineReady.current) return;
-      if (currentGame.isGameOver()) return;
+    function makeEngineMove() {
+      const game = gameRef.current;
+      if (!stockfishRef.current || !isEngineReady.current) {
+        console.log('Engine not ready');
+        return;
+      }
+      if (game.isGameOver()) {
+        console.log('Game is over');
+        return;
+      }
       
       const currentEnemyId = enemyRef.current?.id;
       const currentPlayerColor = playerColorRef.current;
       const settings = getEngineSettingsForEnemy(currentEnemyId);
       const engineColor = currentPlayerColor === 'white' ? 'b' : 'w';
-      const currentMoveNumber = currentGame.moveNumber();
-      const currentFen = currentGame.fen();
+      const currentMoveNumber = moveCountRef.current;
+      const currentFen = game.fen();
+      
+      console.log('Engine calculating move for position:', currentFen);
       
       // Try book move first in opening phase
       const openingBookDepth = currentEnemyId === 'minia0' ? 12 : (currentEnemyId === 'elegant' ? 10 : 8);
       if (currentMoveNumber <= openingBookDepth) {
         const bookMove = getBookMoveForPosition(currentFen, engineColor, currentEnemyId);
         if (bookMove) {
-          // Personality-based thinking time variation
+          console.log('Using book move:', bookMove);
           const minTime = settings.thinkingTimeMin || 150;
           const maxTime = settings.thinkingTimeMax || 800;
           const thinkTime = minTime + Math.random() * (maxTime - minTime) * (settings.openingSpeed || 0.5);
-          setTimeout(() => applyMoveToGame(bookMove), thinkTime);
+          setIsThinking(true);
+          setTimeout(() => {
+            applyEngineMove(bookMove);
+            setIsThinking(false);
+          }, thinkTime);
           return;
         }
       }
       
       setIsThinking(true);
       
-      // Use ADAPTIVE depth based on game phase and position type
       const adaptiveDepth = getAdaptiveDepthForPosition(currentFen, currentMoveNumber, currentEnemyId);
-      
-      // Apply personality-specific engine settings before search
       const skillLevel = currentEnemyId === 'minia0' ? 15 : 20;
+      
       stockfishRef.current.postMessage(`setoption name Skill Level value ${skillLevel}`);
       stockfishRef.current.postMessage(`setoption name Contempt value ${settings.contempt || 24}`);
       
-      // Set callback for when bestmove is received
-      pendingCallback = applyMoveToGame;
+      pendingCallback = applyEngineMove;
       
       stockfishRef.current.postMessage(`position fen ${currentFen}`);
       stockfishRef.current.postMessage(`go depth ${adaptiveDepth}`);
     }
     
-    // Store triggerEngineMove in a ref so it can be called from outside
-    stockfishRef.current.triggerEngineMove = triggerEngineMove;
+    // Store makeEngineMove in stockfishRef so it can be called from outside
+    stockfishRef.current.makeEngineMove = makeEngineMove;
     
     return () => {
       if (stockfishRef.current) {
@@ -349,43 +365,57 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   }, []);
 
   // Handle game over
-  const handleGameOver = (gameInstance) => {
+  const handleGameOver = useCallback((game) => {
     let result;
-    if (gameInstance.isCheckmate()) {
-      const loser = gameInstance.turn();
+    if (game.isCheckmate()) {
+      const loser = game.turn();
       const playerWon = (playerColor === 'white' && loser === 'b') || 
                         (playerColor === 'black' && loser === 'w');
       result = playerWon ? 'player' : 'enemy';
-    } else if (gameInstance.isDraw() || gameInstance.isStalemate()) {
+    } else if (game.isDraw() || game.isStalemate()) {
       result = 'draw';
     }
     
     setGameStatus('ended');
     setTimeout(() => onGameEnd(result), 1500);
-  };
+  }, [playerColor, onGameEnd]);
 
   // Handle player move
-  const onDrop = (sourceSquare, targetSquare, piece) => {
-    if (isThinking || gameStatus !== 'playing') return false;
+  const onDrop = useCallback((sourceSquare, targetSquare, piece) => {
+    if (isThinking || gameStatus !== 'playing') {
+      console.log('Cannot move - thinking or game ended');
+      return false;
+    }
     
+    const game = gameRef.current;
     const turn = game.turn();
     const isPlayerTurn = (playerColor === 'white' && turn === 'w') || 
                          (playerColor === 'black' && turn === 'b');
     
-    if (!isPlayerTurn) return false;
+    if (!isPlayerTurn) {
+      console.log('Not player turn');
+      return false;
+    }
     
     try {
-      const gameCopy = new Chess(game.fen());
-      const moveResult = gameCopy.move({
+      const moveResult = game.move({
         from: sourceSquare,
         to: targetSquare,
         promotion: 'q'
       });
       
-      if (moveResult === null) return false;
+      if (moveResult === null) {
+        console.log('Invalid move');
+        return false;
+      }
       
-      setGame(gameCopy);
-      setPosition(gameCopy.fen());
+      moveCountRef.current++;
+      const newFen = game.fen();
+      
+      // Update all state synchronously
+      setPosition(newFen);
+      setCurrentTurn(game.turn());
+      setIsInCheck(game.isCheck() && !game.isCheckmate());
       setMoveHistory(prev => [...prev, moveResult.san]);
       setLastMove({ from: sourceSquare, to: targetSquare });
       
@@ -397,28 +427,35 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         }));
       }
       
-      if (gameCopy.isGameOver()) {
-        handleGameOver(gameCopy);
+      console.log('Player move:', moveResult.san, 'Position:', newFen);
+      
+      if (game.isGameOver()) {
+        handleGameOver(game);
         return true;
       }
       
       // Trigger engine to make its move
       setTimeout(() => {
-        if (stockfishRef.current?.triggerEngineMove) {
-          stockfishRef.current.triggerEngineMove(gameCopy);
+        if (stockfishRef.current?.makeEngineMove) {
+          stockfishRef.current.makeEngineMove();
         }
       }, 300);
+      
       return true;
     } catch (e) {
+      console.error('Move error:', e);
       return false;
     }
-  };
+  }, [isThinking, gameStatus, playerColor, handleGameOver]);
 
   // Reset game
-  const resetGame = () => {
+  const resetGame = useCallback(() => {
     const newGame = new Chess();
-    setGame(newGame);
-    setPosition('start');
+    gameRef.current = newGame;
+    moveCountRef.current = 0;
+    setPosition(newGame.fen());
+    setCurrentTurn('w');
+    setIsInCheck(false);
     setMoveHistory([]);
     setGameStatus('playing');
     setLastMove(null);
@@ -426,12 +463,12 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     
     if (playerColor === 'black') {
       setTimeout(() => {
-        if (stockfishRef.current?.triggerEngineMove) {
-          stockfishRef.current.triggerEngineMove(newGame);
+        if (stockfishRef.current?.makeEngineMove) {
+          stockfishRef.current.makeEngineMove();
         }
       }, 500);
     }
-  };
+  }, [playerColor]);
 
   // Resign
   const handleResign = () => {
@@ -506,8 +543,8 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     };
   }
 
-  const isPlayerTurn = (playerColor === 'white' && game.turn() === 'w') || 
-                       (playerColor === 'black' && game.turn() === 'b');
+  const isPlayerTurn = (playerColor === 'white' && currentTurn === 'w') || 
+                       (playerColor === 'black' && currentTurn === 'b');
 
   return (
     <div className="min-h-screen w-full flex flex-col items-center justify-center p-2 sm:p-4 relative overflow-hidden" data-testid="chess-game-container">
@@ -699,7 +736,7 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
           </div>
           
           {/* Check indicator */}
-          {game.isCheck() && !game.isCheckmate() && (
+          {isInCheck && (
             <div 
               className="absolute -top-8 left-1/2 -translate-x-1/2 px-4 py-1 rounded-full text-xs"
               style={{
