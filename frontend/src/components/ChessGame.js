@@ -141,10 +141,11 @@ function getBookMoveForPosition(fen, color, enemyId) {
 // ═══════════════════════════════════════════════════════════════════════
 const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   // Initialize game state - create initial Chess instance once
-  const [gameInstance] = useState(() => new Chess());
-  const gameRef = useRef(gameInstance);
+  // IMPORTANT: Use useRef for game instance to avoid state sync issues
+  const gameRef = useRef(new Chess());
   // Position as FEN string - this drives the visual board
-  const [position, setPosition] = useState(() => new Chess().fen());
+  // Initialize from the SAME game instance to ensure sync
+  const [position, setPosition] = useState('start');
   const [isThinking, setIsThinking] = useState(false);
   const [moveHistory, setMoveHistory] = useState([]);
   const [gameStatus, setGameStatus] = useState('playing');
