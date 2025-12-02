@@ -139,14 +139,19 @@ function getBookMoveForPosition(fen, color, enemyId) {
 // ═══════════════════════════════════════════════════════════════════════
 // CHESS GAME COMPONENT
 // ═══════════════════════════════════════════════════════════════════════
+// Starting position FEN constant
+const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+
 const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
-  // CRITICAL FIX: Use a single Chess instance stored in ref
-  // The position state MUST always reflect gameRef.current.fen() exactly
-  const gameRef = useRef(new Chess());
+  // Create Chess instance lazily to avoid recreating on each render
+  const gameRef = useRef(null);
+  if (gameRef.current === null) {
+    gameRef.current = new Chess();
+  }
   
-  // Position as FEN string - this drives the visual board AND move validation
-  // react-chessboard uses this for both display and validating drops
-  const [position, setPosition] = useState(() => gameRef.current.fen());
+  // Position as FEN string - initialized with constant, NOT from ref
+  // This drives both the visual display AND move validation in react-chessboard
+  const [position, setPosition] = useState(STARTING_FEN);
   const [isThinking, setIsThinking] = useState(false);
   const [moveHistory, setMoveHistory] = useState([]);
   const [gameStatus, setGameStatus] = useState('playing');
@@ -155,16 +160,26 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   const [boardSize, setBoardSize] = useState(280);
   const [isResizing, setIsResizing] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
-  const [currentTurn, setCurrentTurn] = useState('w'); // Track current turn for UI
-  const [isInCheck, setIsInCheck] = useState(false); // Track check state
+  const [currentTurn, setCurrentTurn] = useState('w');
+  const [isInCheck, setIsInCheck] = useState(false);
   const stockfishRef = useRef(null);
   const isEngineReady = useRef(false);
   const boardContainerRef = useRef(null);
   const resizeStartRef = useRef({ x: 0, y: 0, size: 0 });
   const moveCountRef = useRef(0);
-  const hasInitializedEngineMove = useRef(false); // Prevent double initial move
+  const hasInitializedEngineMove = useRef(false);
   
-  // Refs to store props for use in stockfish callback (avoid stale closures)
+  // Refs for state setters to use in callbacks (avoid stale closures)
+  const setPositionRef = useRef(setPosition);
+  const setCurrentTurnRef = useRef(setCurrentTurn);
+  const setIsInCheckRef = useRef(setIsInCheck);
+  const setMoveHistoryRef = useRef(setMoveHistory);
+  const setLastMoveRef = useRef(setLastMove);
+  const setCapturedPiecesRef = useRef(setCapturedPieces);
+  const setGameStatusRef = useRef(setGameStatus);
+  const setIsThinkingRef = useRef(setIsThinking);
+  
+  // Refs to store props for use in stockfish callback
   const enemyRef = useRef(enemy);
   const playerColorRef = useRef(playerColor);
   const gameStatusRef = useRef(gameStatus);
@@ -176,7 +191,16 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     playerColorRef.current = playerColor;
     gameStatusRef.current = gameStatus;
     onGameEndRef.current = onGameEnd;
-  }, [enemy, playerColor, gameStatus, onGameEnd]);
+    // Update setter refs
+    setPositionRef.current = setPosition;
+    setCurrentTurnRef.current = setCurrentTurn;
+    setIsInCheckRef.current = setIsInCheck;
+    setMoveHistoryRef.current = setMoveHistory;
+    setLastMoveRef.current = setLastMove;
+    setCapturedPiecesRef.current = setCapturedPieces;
+    setGameStatusRef.current = setGameStatus;
+    setIsThinkingRef.current = setIsThinking;
+  });
 
   // Detect mobile device
   useEffect(() => {
@@ -268,19 +292,21 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
         
         if (moveResult) {
           moveCountRef.current++;
-          // Update all state synchronously - get fresh FEN after move
+          // Get fresh FEN after move
           const newFen = game.fen();
           
-          // Batch state updates
-          setPosition(newFen);
-          setCurrentTurn(game.turn());
-          setIsInCheck(game.isCheck() && !game.isCheckmate());
-          setMoveHistory(prev => [...prev, moveResult.san]);
-          setLastMove({ from, to });
+          console.log('Engine move applied:', moveResult.san, 'New FEN:', newFen);
+          
+          // Use refs to call the latest state setters (avoid stale closures)
+          setPositionRef.current(newFen);
+          setCurrentTurnRef.current(game.turn());
+          setIsInCheckRef.current(game.isCheck() && !game.isCheckmate());
+          setMoveHistoryRef.current(prev => [...prev, moveResult.san]);
+          setLastMoveRef.current({ from, to });
           
           if (moveResult.captured) {
             const capturedColor = moveResult.color === 'w' ? 'black' : 'white';
-            setCapturedPieces(prev => ({
+            setCapturedPiecesRef.current(prev => ({
               ...prev,
               [capturedColor]: [...prev[capturedColor], moveResult.captured]
             }));
@@ -297,11 +323,9 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
             } else {
               result = 'draw';
             }
-            setGameStatus('ended');
+            setGameStatusRef.current('ended');
             setTimeout(() => onGameEndRef.current(result), 1500);
           }
-          
-          console.log('Engine move applied:', moveResult.san, 'New FEN:', newFen);
         }
       } catch (e) {
         console.error('Engine move error:', e);
@@ -338,16 +362,16 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
           const minTime = settings.thinkingTimeMin || 150;
           const maxTime = settings.thinkingTimeMax || 800;
           const thinkTime = minTime + Math.random() * (maxTime - minTime) * (settings.openingSpeed || 0.5);
-          setIsThinking(true);
+          setIsThinkingRef.current(true);
           setTimeout(() => {
             applyEngineMove(bookMove);
-            setIsThinking(false);
+            setIsThinkingRef.current(false);
           }, thinkTime);
           return;
         }
       }
       
-      setIsThinking(true);
+      setIsThinkingRef.current(true);
       
       const adaptiveDepth = getAdaptiveDepthForPosition(currentFen, currentMoveNumber, currentEnemyId);
       const skillLevel = currentEnemyId === 'minia0' ? 15 : 20;
