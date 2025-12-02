@@ -64,6 +64,18 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
   const pendingMove = useRef(false);
   const boardContainerRef = useRef(null);
   const resizeStartRef = useRef({ x: 0, y: 0, size: 0 });
+  
+  // Refs for storing function references (for use in useEffect with empty deps)
+  const makeEngineMoveRef = useRef(null);
+  const applyEngineMoveRef = useRef(null);
+  const enemyRef = useRef(enemy);
+  const playerColorRef = useRef(playerColor);
+  
+  // Keep refs updated
+  useEffect(() => {
+    enemyRef.current = enemy;
+    playerColorRef.current = playerColor;
+  }, [enemy, playerColor]);
 
   // Detect mobile device
   useEffect(() => {
@@ -170,56 +182,49 @@ const ChessGame = ({ enemy, playerColor, onGameEnd, onBack }) => {
     return moves[0].move;
   }, [getEngineSettings]);
 
-  // Initialize Stockfish with personality-specific settings
+  // Initialize Stockfish - Simplified instant initialization (no retry/catch blocks)
+  // Based on outdated engine.js pattern for reliable move generation
   useEffect(() => {
-    const initEngine = async () => {
-      try {
-        stockfishRef.current = new Worker('/stockfish.js');
-        
-        stockfishRef.current.onmessage = (event) => {
-          const message = event.data;
-          
-          if (message === 'uciok') {
-            const settings = getEngineSettings();
-            // Apply personality-specific engine settings
-            const skillLevel = enemy?.id === 'minia0' ? 15 : 20;
-            stockfishRef.current.postMessage(`setoption name Skill Level value ${skillLevel}`);
-            stockfishRef.current.postMessage(`setoption name Contempt value ${settings.contempt || 24}`);
-            stockfishRef.current.postMessage(`setoption name MultiPV value 1`);
-            stockfishRef.current.postMessage('isready');
-          }
-          
-          if (message === 'readyok') {
-            isEngineReady.current = true;
-            if (playerColor === 'black') {
-              setTimeout(() => makeEngineMove(new Chess()), 500);
-            }
-          }
-          
-          if (message.startsWith('bestmove')) {
-            const move = message.split(' ')[1];
-            if (move && move !== '(none)' && pendingMove.current) {
-              pendingMove.current = false;
-              applyEngineMove(move);
-            }
-            setIsThinking(false);
-          }
-        };
-        
-        stockfishRef.current.postMessage('uci');
-      } catch (error) {
-        console.error('Failed to initialize Stockfish:', error);
+    // Create Web Worker for Stockfish - instant initialization
+    stockfishRef.current = new Worker('/stockfish.js');
+    
+    stockfishRef.current.onmessage = (event) => {
+      const line = event.data;
+      
+      if (line === 'uciok') {
+        // Apply personality-specific settings after UCI confirmation
+        const settings = getEngineSettings();
+        const skillLevel = enemy?.id === 'minia0' ? 15 : 20;
+        stockfishRef.current.postMessage(`setoption name Skill Level value ${skillLevel}`);
+        stockfishRef.current.postMessage(`setoption name Contempt value ${settings.contempt || 24}`);
+        stockfishRef.current.postMessage(`setoption name MultiPV value 1`);
+        stockfishRef.current.postMessage('isready');
+      } else if (line === 'readyok') {
+        isEngineReady.current = true;
+        // If playing black, engine makes first move
+        if (playerColor === 'black') {
+          setTimeout(() => makeEngineMove(new Chess()), 500);
+        }
+      } else if (line.startsWith('bestmove')) {
+        const parts = line.split(' ');
+        const bestMove = parts[1];
+        if (bestMove && bestMove !== '(none)' && pendingMove.current) {
+          pendingMove.current = false;
+          applyEngineMove(bestMove);
+        }
+        setIsThinking(false);
       }
     };
-
-    initEngine();
-
+    
+    // Initialize UCI protocol
+    stockfishRef.current.postMessage('uci');
+    
     return () => {
       if (stockfishRef.current) {
         stockfishRef.current.terminate();
       }
     };
-  }, [playerColor, getEngineSettings, enemy]);
+  }, []);
 
   // Apply engine's move to the game
   const applyEngineMove = useCallback((moveStr) => {
